@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+*.txt
+*.xml
+*.json
+parsed_from_*.json
+sample_from_*.json
+*_parsed.json
+dashboard-debug.log
