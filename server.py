@@ -12,15 +12,19 @@ One file, zero third-party dependencies:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import re
 import sys
 import time
+import uuid
 from collections import Counter
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -33,6 +37,12 @@ from xml.etree import ElementTree as ET
 APP_NAME = "ScanLens"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 LOG = logging.getLogger("scanlens")
+BASE_DIR = Path(__file__).resolve().parent
+SESSIONS_ROOT = BASE_DIR / "sessions"
+SESSION_COOKIE = "scanlens_session"
+SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+REPORT_ID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
+SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 NMAP_RUN_RE = re.compile(r"<nmaprun\b.*?</nmaprun>", re.IGNORECASE | re.DOTALL)
 NMAP_TEXT_RUN_RE = re.compile(r"(?=^# Nmap .*? scan initiated|^Starting Nmap\s+)", re.IGNORECASE | re.MULTILINE)
@@ -68,6 +78,104 @@ def elapsed_ms(started: float) -> float:
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def new_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+def new_report_id() -> str:
+    return str(uuid.uuid4())
+
+
+def sanitize_filename(filename: str) -> str:
+    name = Path(filename or "uploaded-scan").name
+    name = SAFE_FILENAME_RE.sub("_", name).strip("._")
+    return name or "uploaded-scan"
+
+
+def session_directory(session_id: str) -> Path:
+    if not SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError("Invalid session id.")
+    root = SESSIONS_ROOT.resolve()
+    path = (root / session_id).resolve()
+    if root != path and root not in path.parents:
+        raise ValueError("Session path escaped sessions directory.")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def session_relative(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def unique_session_file(session_id: str, filename: str, index: int) -> Path:
+    directory = session_directory(session_id)
+    safe_name = sanitize_filename(filename)
+    base = f"{utc_stamp()}_{index:03d}_{safe_name}"
+    path = directory / base
+    counter = 1
+    while path.exists():
+        stem = Path(base).stem
+        suffix = Path(base).suffix
+        path = directory / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return path
+
+
+def write_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def update_session_manifest(session_id: str, uploads: list[dict[str, Any]], workspace: dict[str, Any] | None = None) -> None:
+    directory = session_directory(session_id)
+    manifest_path = directory / "session.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
+    else:
+        manifest = {}
+    manifest.setdefault("session_id", session_id)
+    manifest.setdefault("created_at", utc_stamp())
+    manifest["updated_at"] = utc_stamp()
+    manifest.setdefault("uploads", [])
+    manifest.setdefault("workspaces", [])
+    manifest.setdefault("reports", [])
+    manifest["uploads"].extend(uploads)
+    if workspace:
+        if workspace.get("kind") == "report":
+            manifest["reports"].append(workspace)
+        else:
+            manifest["workspaces"].append(workspace)
+    write_json_file(manifest_path, manifest)
+
+
+def report_path(session_id: str, report_id: str) -> Path:
+    if not REPORT_ID_RE.fullmatch(report_id):
+        raise ValueError("Invalid report id.")
+    return session_directory(session_id) / f"report_{report_id}.json"
+
+
+def find_report(report_id: str) -> Path | None:
+    if not REPORT_ID_RE.fullmatch(report_id):
+        return None
+    root = SESSIONS_ROOT.resolve()
+    if not root.exists():
+        return None
+    for candidate in root.glob(f"*/report_{report_id}.json"):
+        resolved = candidate.resolve()
+        if root == resolved or root in resolved.parents:
+            return resolved
+    return None
 
 
 def coerce(value: str | None) -> Any:
@@ -1004,6 +1112,191 @@ def extract_cves(value: object) -> list[str]:
     return sorted(found)
 
 
+def report_risk(summary: dict[str, Any], cves: list[str], check_results: list[dict[str, Any]]) -> tuple[str, str]:
+    classifications = [classify_status(item.get("classification") or item.get("status")) for item in check_results if isinstance(item, dict)]
+    if any(item == "Affected" for item in classifications):
+        return "Action needed", "At least one checked vulnerability appears to affect the selected operating system version."
+    if cves and not check_results:
+        return "Review needed", "The scan found CVE references, but they have not all been checked against the chosen operating system."
+    if cves:
+        return "Monitor", "The scan found CVE references. Review the listed items and keep the system patched."
+    if int(summary.get("open_port_count") or 0) > 0:
+        return "No CVEs found", "Open network services were found, but this report did not identify CVE references in the uploaded evidence."
+    return "Low signal", "The uploaded evidence did not show open ports or CVE references."
+
+
+def summarize_report_for_people(report: dict[str, Any]) -> dict[str, Any]:
+    workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
+    summary = workspace.get("summary", {}) if isinstance(workspace.get("summary"), dict) else {}
+    check_results = report.get("check_results") if isinstance(report.get("check_results"), list) else []
+    cves = report.get("cves") if isinstance(report.get("cves"), list) else extract_cves(workspace)
+    risk, meaning = report_risk(summary, cves, check_results)
+    affected = [item for item in check_results if classify_status(item.get("classification") or item.get("status")) == "Affected"]
+    fixed = [item for item in check_results if classify_status(item.get("classification") or item.get("status")) == "Fixed"]
+    not_affected = [item for item in check_results if classify_status(item.get("classification") or item.get("status")) == "Not affected"]
+    return {
+        "risk": risk,
+        "meaning": meaning,
+        "files": summary.get("file_count", 0),
+        "hosts": summary.get("host_count", 0),
+        "open_ports": summary.get("open_port_count", 0),
+        "cves": len(cves),
+        "affected": len(affected),
+        "fixed": len(fixed),
+        "not_affected": len(not_affected),
+    }
+
+
+def h(value: object) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def render_public_report(report: dict[str, Any]) -> str:
+    people = summarize_report_for_people(report)
+    workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
+    summary = workspace.get("summary", {}) if isinstance(workspace.get("summary"), dict) else {}
+    hosts = workspace.get("hosts", []) if isinstance(workspace.get("hosts"), list) else []
+    files = workspace.get("files", []) if isinstance(workspace.get("files"), list) else []
+    cves = report.get("cves") if isinstance(report.get("cves"), list) else extract_cves(workspace)
+    check_results = report.get("check_results") if isinstance(report.get("check_results"), list) else []
+
+    service_counts = summary.get("service_counts", {}) if isinstance(summary.get("service_counts"), dict) else {}
+    checked_by_cve = {item.get("cve"): item for item in check_results if isinstance(item, dict)}
+    attention = []
+    quiet_count = 0
+
+    if check_results:
+        for item in check_results:
+            if not isinstance(item, dict):
+                continue
+            classification = classify_status(item.get("classification") or item.get("status"))
+            if classification in {"Fixed", "Not affected", "Not found"}:
+                quiet_count += 1
+                continue
+            attention.append({
+                "kind": "vulnerability",
+                "label": item.get("cve", "Unknown CVE"),
+                "severity": classification,
+                "why": item.get("summary") or "This item needs review because the vendor status was not clearly safe.",
+                "next": "Confirm whether this affects the operating system version, then patch or document the exception.",
+            })
+    else:
+        for cve in cves:
+            attention.append({
+                "kind": "vulnerability",
+                "label": cve,
+                "severity": "Needs vendor check",
+                "why": "This CVE was found in the scan evidence, but it has not been checked against RHEL or Ubuntu yet.",
+                "next": "Run the advisory status check for the target operating system and version.",
+            })
+
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        for port in host.get("ports", []):
+            if not isinstance(port, dict):
+                continue
+            service = port.get("service", {}) if isinstance(port.get("service"), dict) else {}
+            port_id = str(port.get("portid", ""))
+            service_name = str(service.get("name") or "unknown")
+            scripts = "\n".join(str(script.get("output", "")) for script in port.get("scripts", []) if isinstance(script, dict)).lower()
+            if any(term in scripts for term in ("fail:", "weak cipher", "broken sha-1", "backdoored", "dheat", "terrapin")):
+                attention.append({
+                    "kind": "service exposure",
+                    "label": f"{host.get('address', 'Unknown')}:{port_id} {service_name}",
+                    "severity": "Hardening needed",
+                    "why": "The scan notes weak or risky SSH/security settings for this service.",
+                    "next": "Remove weak algorithms, confirm rate limiting, and keep the service patched.",
+                })
+
+    severity_rank = {"Affected": 0, "Hardening needed": 1, "Needs vendor check": 2, "Lookup failed": 3, "Unknown": 4, "Deferred": 5, "Not listed": 6, "Out of support": 7}
+    attention = sorted(attention, key=lambda item: severity_rank.get(item["severity"], 9))[:18]
+    attention_cards = []
+    for item in attention:
+        css = item["severity"].lower().replace(" ", "-")
+        attention_cards.append(
+            f"<article class='attention-card {h(css)}'><div><span class='eyebrow'>{h(item['kind'])}</span><h3>{h(item['label'])}</h3></div>"
+            f"<span class='pill {h(css)}'>{h(item['severity'])}</span><p>{h(item['why'])}</p><strong>Next step</strong><p>{h(item['next'])}</p></article>"
+        )
+    if not attention_cards:
+        attention_cards.append("<article class='attention-card calm'><span class='eyebrow'>status</span><h3>No attention-needed items</h3><p>The checked evidence did not produce any active or uncertain items. Keep normal patching and monitoring in place.</p></article>")
+
+    key_services = sorted(service_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+    services = "".join(f"<span class='service-chip'>{h(name)} <b>{h(count)}</b></span>" for name, count in key_services)
+    if not services:
+        services = "<span class='service-chip'>No named services</span>"
+
+    top_hosts = []
+    for host in hosts[:6]:
+        ports = host.get("ports", []) if isinstance(host, dict) else []
+        open_ports = [f"{port.get('portid')}/{port.get('protocol', 'tcp')}" for port in ports if isinstance(port, dict)]
+        top_hosts.append(f"<li><strong>{h(host.get('address', 'Unknown'))}</strong><span>{h(', '.join(open_ports[:8]) or 'No ports listed')}</span></li>")
+    if not top_hosts:
+        top_hosts.append("<li><strong>No systems identified</strong><span>Upload evidence with host data for system-level context.</span></li>")
+
+    evidence_note = f"{len(files)} evidence file(s) reviewed"
+    if len(files) == 1:
+        evidence_note = "1 evidence file reviewed"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScanLens Report {h(report.get('report_id'))}</title>
+<style>
+:root{{--bg:#f5f7fb;--panel:#fff;--panel2:#f9fbfd;--text:#101828;--muted:#667085;--line:#d7e0ea;--accent:#0f766e;--bad:#b42318;--warn:#b7791f;--ok:#0f766e;--ink:#111827;--shadow:0 22px 70px rgba(16,24,40,.10)}}*{{box-sizing:border-box}}body{{margin:0;background:linear-gradient(180deg,#eef5fb 0,#f7f9fc 360px,var(--bg) 100%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}}main{{max-width:1180px;margin:0 auto;padding:30px}}.hero{{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px;align-items:stretch;padding:20px 0}}.hero-panel,.card,.attention-card{{background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}}.hero-panel{{padding:28px}}h1{{font-size:42px;line-height:1.05;margin:0 0 12px;letter-spacing:0}}h2{{font-size:18px;margin:0 0 14px}}h3{{font-size:17px;margin:4px 0 0}}p{{line-height:1.58}}.muted{{color:var(--muted)}}.eyebrow{{display:inline-flex;color:var(--muted);font-size:12px;font-weight:850;text-transform:uppercase;letter-spacing:.06em}}.risk-badge{{display:inline-flex;align-items:center;min-height:34px;border-radius:999px;padding:0 12px;font-weight:850;color:#fff;background:var(--ok)}}.risk-badge.action-needed{{background:var(--bad)}}.risk-badge.review-needed,.risk-badge.monitor{{background:var(--warn);color:#211700}}.summary{{display:grid;gap:10px;padding:18px}}.summary b{{font-size:34px;display:block}}.summary span{{color:var(--muted);font-size:12px;font-weight:850;text-transform:uppercase}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}}.card{{padding:16px}}.metric{{min-height:116px}}.metric b{{font-size:32px;display:block}}.metric span{{color:var(--muted);font-size:12px;text-transform:uppercase;font-weight:850}}.attention-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.attention-card{{padding:16px;display:grid;gap:10px;border-left:6px solid var(--warn)}}.attention-card.affected,.attention-card.action-needed,.attention-card.lookup-failed{{border-left-color:var(--bad)}}.attention-card.calm{{border-left-color:var(--ok)}}.attention-card p{{margin:0;color:var(--muted)}}.pill{{display:inline-flex;width:max-content;border-radius:999px;padding:5px 10px;background:#64748b;color:white;font-size:12px;font-weight:850}}.pill.affected,.pill.action-needed,.pill.lookup-failed{{background:var(--bad)}}.pill.hardening-needed,.pill.needs-vendor-check,.pill.review-needed,.pill.monitor,.pill.unknown,.pill.deferred,.pill.not-listed,.pill.out-of-support{{background:var(--warn);color:#211700}}.service-row{{display:flex;flex-wrap:wrap;gap:8px}}.service-chip{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:999px;background:var(--panel2);padding:8px 11px;color:var(--muted)}}.service-chip b{{color:var(--text)}}.host-list{{display:grid;gap:8px;padding:0;list-style:none;margin:0}}.host-list li{{display:flex;justify-content:space-between;gap:14px;border:1px solid var(--line);border-radius:12px;padding:11px;background:var(--panel2)}}.quiet{{color:var(--muted);font-size:13px}}@media(max-width:850px){{main{{padding:18px}}.hero,.grid,.attention-grid{{grid-template-columns:1fr}}h1{{font-size:32px}}}}
+</style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <div class="hero-panel">
+      <span class="eyebrow">ScanLens shared report · {h(report.get('created_at'))}</span>
+      <h1>{h(report.get('workspace_name') or summary.get('source_file') or 'Workspace report')}</h1>
+      <span class="risk-badge {h(people['risk']).lower().replace(' ', '-')}">{h(people['risk'])}</span>
+      <p>{h(people['meaning'])}</p>
+      <p class="quiet">This page is intentionally focused on attention-needed items. Details that are already fixed or not affected are kept out of the main view.</p>
+    </div>
+    <aside class="summary card">
+      <div><b>{h(len(attention))}</b><span>Attention items</span></div>
+      <div><b>{h(quiet_count)}</b><span>Cleared or low-priority items hidden</span></div>
+      <p class="quiet">{h(evidence_note)} · link is hard to guess, but anyone with the URL can view it.</p>
+    </aside>
+  </section>
+  <section class="grid">
+    <div class="card metric"><b>{h(people['files'])}</b><span>Files reviewed</span></div>
+    <div class="card metric"><b>{h(people['hosts'])}</b><span>Systems found</span></div>
+    <div class="card metric"><b>{h(people['open_ports'])}</b><span>Open services</span></div>
+    <div class="card metric"><b>{h(people['cves'])}</b><span>CVE references</span></div>
+  </section>
+  <section class="card" style="margin-top:14px">
+    <span class="eyebrow">Priority queue</span>
+    <h2>Only items needing attention</h2>
+    <div class="attention-grid">{''.join(attention_cards)}</div>
+  </section>
+  <section class="grid" style="grid-template-columns:1.2fr .8fr;margin-top:14px">
+    <div class="card">
+      <span class="eyebrow">Exposure snapshot</span>
+      <h2>Systems with reachable services</h2>
+      <ul class="host-list">{''.join(top_hosts)}</ul>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Services</span>
+      <h2>Observed service types</h2>
+      <div class="service-row">{services}</div>
+    </div>
+  </section>
+  <section class="card" style="margin-top:18px">
+    <span class="eyebrow">Recommended response</span>
+    <h2>Suggested next steps</h2>
+    <p>Resolve affected items first, run vendor checks for anything marked “Needs vendor check,” and apply hardening for services with weak algorithms or risky configuration. Keep fixed or not-affected items in the JSON export for audit evidence, but they do not need executive attention here.</p>
+  </section>
+</main>
+</body>
+</html>"""
+
+
 def classify_status(status: object) -> str:
     text = str(status or "").strip().lower().replace("_", " ")
     if not text:
@@ -1200,6 +1493,50 @@ def parse_multipart_file(content_type: str, body: bytes) -> tuple[str, bytes]:
     return parse_multipart_files(content_type, body)[0]
 
 
+def persist_session_uploads(session_id: str, uploads: list[tuple[str, bytes]]) -> list[dict[str, Any]]:
+    stored = []
+    for index, (filename, payload) in enumerate(uploads, start=1):
+        path = unique_session_file(session_id, filename, index)
+        path.write_bytes(payload)
+        item = {
+            "filename": filename,
+            "stored_path": session_relative(path),
+            "size": len(payload),
+            "stored_at": utc_stamp(),
+        }
+        stored.append(item)
+        LOG.debug("session_file stored session=%s file=%s bytes=%s path=%s", session_id, filename, len(payload), item["stored_path"])
+    return stored
+
+
+def persist_report(session_id: str, workspace: dict[str, Any], cves: list[str], check_results: list[dict[str, Any]], workspace_name: str) -> dict[str, Any]:
+    report_id = new_report_id()
+    report = {
+        "report_id": report_id,
+        "created_at": utc_stamp(),
+        "session_id": session_id,
+        "workspace_name": workspace_name,
+        "workspace": workspace,
+        "cves": sorted({str(item).upper() for item in cves if normalize_cve(item)}),
+        "check_results": check_results,
+    }
+    if not report["cves"]:
+        report["cves"] = extract_cves(workspace)
+    report["plain_summary"] = summarize_report_for_people(report)
+    path = report_path(session_id, report_id)
+    write_json_file(path, report)
+    update_session_manifest(session_id, [], {
+        "kind": "report",
+        "id": report_id,
+        "name": workspace_name,
+        "stored_path": session_relative(path),
+        "url": f"/{report_id}",
+        "summary": report["plain_summary"],
+        "stored_at": utc_stamp(),
+    })
+    return {"report": report, "path": path}
+
+
 HTML = r"""<!doctype html>
 <html lang="en" data-theme="light">
 <head>
@@ -1217,7 +1554,7 @@ HTML = r"""<!doctype html>
 <div class="shell">
   <header class="top">
     <div class="brand"><div class="mark"></div><div><h1>ScanLens</h1><p class="sub">Self-contained scan parser, CVE extractor, and Linux advisory cross-checker.</p></div></div>
-    <div class="top-actions"><button class="btn ghost" id="themeBtn">Light</button><button class="btn" id="downloadBtn" disabled>Download JSON</button></div>
+    <div class="top-actions"><button class="btn ghost" id="themeBtn">Light</button><button class="btn" id="downloadBtn" disabled>Export Report</button><a id="reportLink" class="btn ghost" href="#" target="_blank" rel="noreferrer" style="display:none">Open Report</a></div>
   </header>
   <main class="grid">
     <aside class="side">
@@ -1277,7 +1614,7 @@ function createWorkspace(){let id=crypto.randomUUID?crypto.randomUUID():String(D
 function setWorkspace(id){if(activeWorkspaceId&&activeWorkspaceId!==id)syncToWorkspace();activeWorkspaceId=id;renderWorkspaceList();renderActive()}
 function renderWorkspaceList(){let root=$("#workspaceList");root.replaceChildren();workspaces.forEach(ws=>{let b=document.createElement("button");b.type="button";b.className=`workspace-item ${ws.id===activeWorkspaceId?"active":""}`;let s=ws.data?.summary||{};b.innerHTML=`<span class="workspace-name">${ws.name}</span><span class="muted">${fmt(s.file_count||ws.files.length)} files · ${fmt(s.host_count)} hosts · ${fmt(s.cve_count)} CVEs</span>`;b.addEventListener("click",()=>setWorkspace(ws.id));root.append(b)})}
 function renderFileList(files=[]){let root=$("#fileList");root.replaceChildren();files.forEach(file=>{let row=document.createElement("div");row.className="file-item";let name=file.name||file;let meta=file.input_type?`${file.input_type} · ${fmt(file.open_port_count)} open ports`:`${fmt(file.size)} bytes`;row.append(Object.assign(document.createElement("span"),{className:"mono",textContent:name}),Object.assign(document.createElement("span"),{className:"muted",textContent:meta}));root.append(row)})}
-function renderActive(){syncFromWorkspace();let ws=current();let summary=parsed?.summary||{};renderMetrics(summary);serviceChart(summary.service_counts||{});$("#jsonOut").textContent=parsed?JSON.stringify(parsed,null,2):"{}";$("#downloadBtn").disabled=!parsed;$("#extractBtn").disabled=!parsed;$("#distroSelect").disabled=!cves.length;$("#versionSelect").disabled=!cves.length;$("#checkBtn").disabled=!cves.length;renderFileList(ws?.files||parsed?.files||[]);renderHosts();if(checkResults.length){renderCheckedCves()}else if(cves.length){renderCveExtracted()}else{let r=$("#cves");r.className="cves empty";r.textContent=parsed?"Extract CVEs for this workspace.":"Bulk parse files to extract CVEs."}msg($("#parseMessage"),parsed?`${workspaceName()} contains ${fmt(summary.file_count||0)} files.`:"Upload one or more files into this workspace.");msg($("#cveMessage"),parsed?"Ready to extract CVEs.":"Parse a workspace first.");renderWorkspaceList()}
+function renderActive(){syncFromWorkspace();let ws=current();let summary=parsed?.summary||{};renderMetrics(summary);serviceChart(summary.service_counts||{});$("#jsonOut").textContent=parsed?JSON.stringify(parsed,null,2):"{}";$("#downloadBtn").disabled=!parsed;$("#extractBtn").disabled=!parsed;$("#distroSelect").disabled=!cves.length;$("#versionSelect").disabled=!cves.length;$("#checkBtn").disabled=!cves.length;if(ws?.reportUrl){$("#reportLink").href=ws.reportUrl;$("#reportLink").style.display="inline-flex"}else{$("#reportLink").style.display="none"}renderFileList(ws?.files||parsed?.files||[]);renderHosts();if(checkResults.length){renderCheckedCves()}else if(cves.length){renderCveExtracted()}else{let r=$("#cves");r.className="cves empty";r.textContent=parsed?"Extract CVEs for this workspace.":"Bulk parse files to extract CVEs."}msg($("#parseMessage"),parsed?`${workspaceName()} contains ${fmt(summary.file_count||0)} files.`:"Upload one or more files into this workspace.");msg($("#cveMessage"),parsed?"Ready to extract CVEs.":"Parse a workspace first.");renderWorkspaceList()}
 function classify(s){let t=String(s||"").toLowerCase().replace(/_/g," ");if(t.includes("lookup failed"))return"Lookup failed";if(t.includes("not found")||t.includes("404"))return"Not found";if(t.includes("out of support")||t.includes("end of life"))return"Out of support";if(t.includes("deferred")||t.includes("will not fix")||t.includes("ignored"))return"Deferred";if(["affected","new","needed","vulnerable","needs evaluation","needs-triage","needs triage"].includes(t)||t.includes("work in progress"))return"Affected";if(t.includes("not affected")||t.includes("not in release")||t==="dne")return"Not affected";if(t.includes("fixed")||t.includes("released")||t.includes("resolved"))return"Fixed";if(t.includes("not listed"))return"Not listed";if(t.includes("pending"))return"Pending";if(t.includes("checking"))return"Checking";return"Unknown"}
 function pill(text,type="chip"){let e=document.createElement("span");e.className=type==="status"?`status ${cls(text)}`:"chip";e.textContent=text;return e}
 function metric(label,value){let d=document.createElement("div");d.className="card metric";d.innerHTML=`<b>${fmt(value)}</b><span>${label}</span>`;return d}
@@ -1302,7 +1639,7 @@ $("#extractBtn").addEventListener("click",async()=>{if(!parsed)return;let ws=cur
 $("#checkBtn").addEventListener("click",async()=>{if(!cves.length)return;let ws=current(),distro=$("#distroSelect").value,version=$("#versionSelect").value;$("#checkBtn").disabled=true;startChecks();activate("cvesPanel");msg($("#cveMessage"),`Checking ${cves.length} CVEs for ${workspaceName()}...`);let done=0;for(let c of cves){document.getElementById(cveId(c))?.replaceWith(cveCard({cve:c,status:"Checking",summary:"Requesting vendor API...",records:[]}));try{let r=await checkOne(c,distro,version);checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}catch(err){let r={cve:c,status:"Lookup failed",classification:"Lookup failed",summary:err.message,records:[]};checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}if(ws)ws.checkResults=checkResults;done++;$("#progress").textContent=`${done} / ${cves.length} checked`;countBadges()}msg($("#cveMessage"),`Complete: ${done} CVEs checked.`);$("#checkBtn").disabled=false;renderWorkspaceList()});
 $("#fileInput").addEventListener("change",()=>{let files=[...$("#fileInput").files];$("#fileName").textContent=files.length?`${files.length} files selected`:"XML, TXT, NMAP, JSON, logs, or raw text.";renderFileList(files)});
 $("#dropZone").addEventListener("dragover",e=>{e.preventDefault();$("#dropZone").classList.add("drag")});$("#dropZone").addEventListener("dragleave",()=>$("#dropZone").classList.remove("drag"));$("#dropZone").addEventListener("drop",e=>{e.preventDefault();$("#dropZone").classList.remove("drag");if(e.dataTransfer.files.length){$("#fileInput").files=e.dataTransfer.files;$("#fileInput").dispatchEvent(new Event("change"))}});
-$("#filterInput").addEventListener("input",renderHosts);$$(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.tab)));$("#downloadBtn").addEventListener("click",()=>{if(!parsed)return;let blob=new Blob([JSON.stringify(parsed,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`${workspaceName().toLowerCase().replace(/[^a-z0-9]+/g,"-") || "workspace"}-scanlens.json`;a.click();URL.revokeObjectURL(url)});
+$("#filterInput").addEventListener("input",renderHosts);$$(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.tab)));$("#downloadBtn").addEventListener("click",async()=>{if(!parsed)return;let ws=current();$("#downloadBtn").disabled=true;msg($("#parseMessage"),"Exporting shareable report...");try{let res=await fetch("/api/export-workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workspace:parsed,workspace_name:workspaceName(),cves,check_results:checkResults})});let body=await res.json();if(!res.ok)throw new Error(body.error||"Export failed");if(ws){ws.reportUrl=body.url;ws.reportId=body.report_id}$("#reportLink").href=body.url;$("#reportLink").style.display="inline-flex";msg($("#parseMessage"),`Report exported: ${body.url}`);window.open(body.url,"_blank","noopener")}catch(err){msg($("#parseMessage"),err.message,true)}finally{$("#downloadBtn").disabled=!parsed;renderWorkspaceList()}});
 $("#themeBtn").addEventListener("click",()=>{let html=document.documentElement,next=html.dataset.theme==="dark"?"light":"dark";html.dataset.theme=next;localStorage.setItem("theme",next);$("#themeBtn").textContent=next==="dark"?"Dark":"Light"});let saved=localStorage.getItem("theme")||"light";document.documentElement.dataset.theme=saved;$("#themeBtn").textContent=saved==="dark"?"Dark":"Light";populateVersions();$("#distroSelect").addEventListener("change",()=>{populateVersions();if(cves.length)renderCveExtracted()});createWorkspace();
 </script>
 </body>
@@ -1315,14 +1652,37 @@ class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         LOG.info("client=%s %s", self.address_string(), fmt % args)
 
+    def get_session_id(self) -> str:
+        existing = getattr(self, "session_id", None)
+        if existing:
+            return existing
+        cookie_header = self.headers.get("Cookie", "")
+        cookie = SimpleCookie()
+        if cookie_header:
+            cookie.load(cookie_header)
+        morsel = cookie.get(SESSION_COOKIE)
+        session_id = morsel.value if morsel and SESSION_ID_RE.fullmatch(morsel.value) else new_session_id()
+        self.session_id = session_id
+        session_directory(session_id)
+        return session_id
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         LOG.debug("GET path=%s", path)
+        report_id = path.strip("/")
+        if REPORT_ID_RE.fullmatch(report_id):
+            self.handle_public_report(report_id)
+            return
         if path in {"/", "/index.html"}:
+            self.get_session_id()
             self.send_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/health":
             self.send_json({"ok": True, "app": APP_NAME})
+            return
+        if path == "/api/session":
+            session_id = self.get_session_id()
+            self.send_json({"session_id": session_id, "path": session_relative(session_directory(session_id))})
             return
         self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1339,6 +1699,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.handle_check_cve()
         elif path == "/api/check-cves":
             self.handle_check_cves()
+        elif path == "/api/export-workspace":
+            self.handle_export_workspace()
         else:
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1356,13 +1718,31 @@ class AppHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             raise ValueError("Invalid JSON payload.") from exc
 
+    def handle_public_report(self, report_id: str) -> None:
+        started = time.perf_counter()
+        try:
+            path = find_report(report_id)
+            if not path:
+                self.send_json({"error": "Report not found"}, HTTPStatus.NOT_FOUND)
+                return
+            report = json.loads(path.read_text(encoding="utf-8"))
+            LOG.info("report_view id=%s path=%s elapsed_ms=%.1f", report_id, session_relative(path), elapsed_ms(started))
+            self.send_bytes(render_public_report(report).encode("utf-8"), "text/html; charset=utf-8")
+        except Exception as exc:
+            LOG.exception("report_view failed id=%s elapsed_ms=%.1f", report_id, elapsed_ms(started))
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
     def handle_parse(self) -> None:
         started = time.perf_counter()
         try:
+            session_id = self.get_session_id()
             filename, payload = parse_multipart_file(self.headers.get("Content-Type", ""), self.read_body())
+            stored = persist_session_uploads(session_id, [(filename, payload)])
+            update_session_manifest(session_id, stored)
             text = payload.decode("utf-8-sig", errors="replace")
             data = convert_content(text, filename)
-            LOG.info("parse ok file=%s type=%s hosts=%s runs=%s cves=%s elapsed_ms=%.1f", filename, data["summary"]["input_type"], data["summary"]["host_count"], data["summary"]["run_count"], data["summary"]["cve_count"], elapsed_ms(started))
+            data["session"] = {"id": session_id, "path": session_relative(session_directory(session_id)), "files": stored}
+            LOG.info("parse ok session=%s file=%s type=%s hosts=%s runs=%s cves=%s elapsed_ms=%.1f", session_id, filename, data["summary"]["input_type"], data["summary"]["host_count"], data["summary"]["run_count"], data["summary"]["cve_count"], elapsed_ms(started))
             self.send_json(data)
         except Exception as exc:
             LOG.exception("parse failed elapsed_ms=%.1f", elapsed_ms(started))
@@ -1371,14 +1751,19 @@ class AppHandler(BaseHTTPRequestHandler):
     def handle_parse_workspace(self) -> None:
         started = time.perf_counter()
         try:
+            session_id = self.get_session_id()
             uploads = parse_multipart_files(self.headers.get("Content-Type", ""), self.read_body())
+            stored = persist_session_uploads(session_id, uploads)
             documents = []
-            for filename, payload in uploads:
+            for index, (filename, payload) in enumerate(uploads):
                 text = payload.decode("utf-8-sig", errors="replace")
                 document = convert_content(text, filename)
                 documents.append(document)
+                if index < len(stored):
+                    document.setdefault("session_file", stored[index])
                 LOG.debug(
-                    "workspace_file parsed file=%s type=%s hosts=%s runs=%s cves=%s",
+                    "workspace_file parsed session=%s file=%s type=%s hosts=%s runs=%s cves=%s",
+                    session_id,
                     filename,
                     document["summary"]["input_type"],
                     document["summary"]["host_count"],
@@ -1387,13 +1772,32 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             workspace_name = self.headers.get("X-Workspace-Name", "Workspace")
             data = merge_parsed_documents(documents, workspace_name)
+            for index, item in enumerate(data.get("files", [])):
+                if index < len(stored):
+                    item.update({"stored_path": stored[index]["stored_path"], "size": stored[index]["size"]})
+            workspace_path = session_directory(session_id) / f"{utc_stamp()}_workspace_{sanitize_filename(workspace_name)}.json"
+            data["session"] = {
+                "id": session_id,
+                "path": session_relative(session_directory(session_id)),
+                "files": stored,
+                "workspace_path": session_relative(workspace_path),
+            }
+            write_json_file(workspace_path, data)
+            update_session_manifest(session_id, stored, {
+                "name": workspace_name,
+                "stored_path": session_relative(workspace_path),
+                "summary": data.get("summary", {}),
+                "stored_at": utc_stamp(),
+            })
             LOG.info(
-                "parse_workspace ok workspace=%s files=%s hosts=%s runs=%s cves=%s elapsed_ms=%.1f",
+                "parse_workspace ok session=%s workspace=%s files=%s hosts=%s runs=%s cves=%s stored=%s elapsed_ms=%.1f",
+                session_id,
                 workspace_name,
                 len(uploads),
                 data["summary"]["host_count"],
                 data["summary"]["run_count"],
                 data["summary"]["cve_count"],
+                session_relative(workspace_path),
                 elapsed_ms(started),
             )
             self.send_json(data)
@@ -1453,6 +1857,31 @@ class AppHandler(BaseHTTPRequestHandler):
             LOG.exception("check_cves failed")
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
+    def handle_export_workspace(self) -> None:
+        started = time.perf_counter()
+        try:
+            session_id = self.get_session_id()
+            payload = self.read_json()
+            workspace = payload.get("workspace")
+            if not isinstance(workspace, dict):
+                raise ValueError("No workspace object provided.")
+            workspace_name = str(payload.get("workspace_name") or workspace.get("summary", {}).get("source_file") or "Workspace")
+            cves = payload.get("cves") if isinstance(payload.get("cves"), list) else extract_cves(workspace)
+            check_results = payload.get("check_results") if isinstance(payload.get("check_results"), list) else []
+            stored = persist_report(session_id, workspace, cves, check_results, workspace_name)
+            report = stored["report"]
+            url = f"/{report['report_id']}"
+            LOG.info("export_workspace ok session=%s report=%s workspace=%s path=%s elapsed_ms=%.1f", session_id, report["report_id"], workspace_name, session_relative(stored["path"]), elapsed_ms(started))
+            self.send_json({
+                "report_id": report["report_id"],
+                "url": url,
+                "path": session_relative(stored["path"]),
+                "plain_summary": report.get("plain_summary", {}),
+            })
+        except Exception as exc:
+            LOG.exception("export_workspace failed elapsed_ms=%.1f", elapsed_ms(started))
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
     def send_json(self, data: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
@@ -1460,7 +1889,15 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'")
         self.send_header("Content-Length", str(len(payload)))
+        session_id = getattr(self, "session_id", None)
+        if session_id:
+            self.send_header("Set-Cookie", f"{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1480,6 +1917,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     configure_logging()
+    SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+    LOG.info("sessions_root path=%s", session_relative(SESSIONS_ROOT))
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     LOG.info("server_start url=http://%s:%s", args.host, args.port)
     print(f"{APP_NAME} running at http://{args.host}:{args.port}")

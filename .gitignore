@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.log
 samples/
+sessions/
 parsed_from_*.json
 sample_from_*.json
 *_parsed.json

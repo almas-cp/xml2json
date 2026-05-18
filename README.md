@@ -12,6 +12,12 @@ and JavaScript. There are no third-party Python dependencies.
 - Upload `.xml`, `.txt`, `.nmap`, `.json`, logs, or raw text scan artifacts.
 - Create multiple in-browser workspaces and bulk parse several files into each
   workspace.
+- Keep browser sessions server-side: uploads and workspace JSON are stored under
+  `sessions/<session-id>/`.
+- Export a workspace into a hard-to-guess `/<uuid>` report URL, with the report
+  JSON stored in that session folder.
+- Render exported reports as executive dashboards focused on attention-needed
+  items, hiding fixed/not-affected noise from the main view.
 - Parse Nmap XML, appended Nmap XML, Nmap normal text output, lightweight
   ports JSON, ssh-audit JSON, CVE inventory JSON, empty placeholders, and
   generic JSON payloads.
@@ -82,7 +88,11 @@ sudo journalctl -u scanlens -f
 server.py
 README.md
 .gitignore
+requirements.txt
 ```
 
+Runtime uploads are written to `sessions/<session-id>/` and ignored by git.
+Exported reports are stored as `sessions/<session-id>/report_<uuid>.json` and
+served at `/<uuid>` with a simplified dashboard for non-technical readers.
 Sample scan files may be kept locally for testing, but the application itself is
 only `server.py`.
