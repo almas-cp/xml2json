@@ -18,6 +18,8 @@ and JavaScript. There are no third-party Python dependencies.
   JSON stored in that session folder.
 - Render exported reports as executive dashboards focused on attention-needed
   items, hiding fixed/not-affected noise from the main view.
+- Optionally generate a Groq-assisted executive report summary during export,
+  then store that summary in the saved report JSON.
 - Parse Nmap XML, appended Nmap XML, Nmap normal text output, lightweight
   ports JSON, ssh-audit JSON, CVE inventory JSON, empty placeholders, and
   generic JSON payloads.
@@ -28,12 +30,27 @@ and JavaScript. There are no third-party Python dependencies.
 - Check each CVE individually against:
   - Red Hat: `https://access.redhat.com/hydra/rest/securitydata/cve/{CVE-ID}.json`
   - Ubuntu: `https://ubuntu.com/security/cves/{CVE-ID}.json`
+- Optionally ask Groq to cross-check the returned vendor JSON against the
+  selected RHEL/Ubuntu version and attach a plain-language review to each CVE.
 - Classify results as `Affected`, `Fixed`, `Not affected`, `Deferred`,
   `Out of support`, `Not found`, `Lookup failed`, `Not listed`, or `Unknown`.
 - Light theme by default, with a dark mode toggle.
 - Detailed debug logs printed in the terminal by default.
 
 ## Run Locally
+
+Create `.env` from `.env.example` and set your key when you want AI-assisted
+cross-checks:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and fill in `GROQ_API_KEY`.
+
+The app reads `.env` itself, so no Python package is needed for environment
+loading. If `GROQ_API_KEY` is empty, the Red Hat/Ubuntu checks still work and
+the Groq review is skipped.
 
 ```bash
 python3 server.py --host 0.0.0.0 --port 8000
@@ -96,3 +113,18 @@ Exported reports are stored as `sessions/<session-id>/report_<uuid>.json` and
 served at `/<uuid>` with a simplified dashboard for non-technical readers.
 Sample scan files may be kept locally for testing, but the application itself is
 only `server.py`.
+
+## Groq Settings
+
+```env
+GROQ_API_KEY=
+GROQ_MODEL=openai/gpt-oss-20b
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_DISABLED=false
+```
+
+ScanLens uses Groq's OpenAI-compatible chat-completions endpoint:
+`https://api.groq.com/openai/v1/chat/completions`.
+
+Groq requests are throttled server-side to one request every 2 seconds, with a
+single retry when Groq returns `429 Too Many Requests`.

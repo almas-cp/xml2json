@@ -1,1 +1,1 @@
-python3>=3.9
+# No third-party Python packages are required.
