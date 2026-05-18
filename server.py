@@ -49,6 +49,8 @@ NMAP_DONE_HASH_RE = re.compile(
 )
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+JSON_DOUBLE_COMMA_RE = re.compile(r"(?:,\s*){2,}")
+JSON_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
 RHEL_VERSIONS = ["6", "7", "8", "9", "10"]
 UBUNTU_RELEASES = {
@@ -478,6 +480,15 @@ def primary_address(host: dict[str, Any]) -> str | None:
     return None
 
 
+def merge_non_empty(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in (incoming or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        merged[key] = value
+    return merged
+
+
 def flatten_hosts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hosts_by_addr: dict[str, dict[str, Any]] = {}
     for run in runs:
@@ -512,7 +523,7 @@ def flatten_hosts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "seen_in_runs": [],
                 })
                 stored["state"] = port.get("state", stored["state"])
-                stored["service"] = {**stored.get("service", {}), **port.get("service", {})}
+                stored["service"] = merge_non_empty(stored.get("service", {}), port.get("service", {}))
                 stored["seen_in_runs"].append(run.get("run_index", 1))
                 for script in port.get("scripts", []):
                     if script not in stored["scripts"]:
@@ -532,6 +543,15 @@ def flatten_hosts(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         host["ports"] = sorted(ports, key=lambda item: (str(item.get("protocol", "")), int(item.get("portid") or 0)))
         flattened.append(host)
     return sorted(flattened, key=lambda item: item["address"])
+
+
+def empty_analysis(source_name: str, input_type: str = "empty") -> dict[str, Any]:
+    return {
+        "summary": build_summary(source_name, input_type, [], [], ""),
+        "hosts": [],
+        "runs": [],
+        "raw": "",
+    }
 
 
 def build_summary(source_name: str, input_type: str, runs: list[dict[str, Any]], hosts: list[dict[str, Any]], raw: object = None) -> dict[str, Any]:
@@ -562,6 +582,303 @@ def build_summary(source_name: str, input_type: str, runs: list[dict[str, Any]],
     }
 
 
+def load_json_lenient(scan_text: str, source_name: str) -> Any:
+    try:
+        return json.loads(scan_text)
+    except json.JSONDecodeError as first_error:
+        cleaned = JSON_DOUBLE_COMMA_RE.sub(",", scan_text)
+        cleaned = JSON_TRAILING_COMMA_RE.sub(r"\1", cleaned)
+        if cleaned == scan_text:
+            raise
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            raise first_error
+        LOG.warning("json_repair applied file=%s original_error=%s", source_name, first_error)
+        return data
+
+
+def normalize_json_port(port: dict[str, Any]) -> dict[str, Any]:
+    port_id = port.get("portid", port.get("port", port.get("number")))
+    protocol = str(port.get("protocol", port.get("proto", "tcp")) or "tcp").lower()
+    state_value = port.get("state", port.get("status", port.get("state_state", "unknown")))
+    state = state_value if isinstance(state_value, dict) else {"state": str(state_value or "unknown")}
+    if port.get("reason") and isinstance(state, dict):
+        state.setdefault("reason", port.get("reason"))
+    if port.get("ttl") and isinstance(state, dict):
+        state.setdefault("reason_ttl", port.get("ttl"))
+
+    service_value = port.get("service", port.get("name", ""))
+    service = service_value if isinstance(service_value, dict) else {"name": normalize_service_name(str(service_value or ""))}
+    if not service.get("name") and port.get("product"):
+        service["name"] = normalize_service_name(str(port.get("product")))
+
+    out = {
+        "protocol": protocol,
+        "portid": int(port_id) if str(port_id).isdigit() else port_id,
+        "state": state,
+        "service": service,
+        "scripts": port.get("scripts", []),
+    }
+    for key in ("timestamp", "reason", "ttl", "raw"):
+        if key in port:
+            out[key] = port[key]
+    return out
+
+
+def normalize_json_host(record: dict[str, Any]) -> dict[str, Any] | None:
+    address = record.get("ip") or record.get("address") or record.get("host") or record.get("target")
+    if not address and isinstance(record.get("addresses"), list) and record["addresses"]:
+        address = record["addresses"][0].get("addr") if isinstance(record["addresses"][0], dict) else record["addresses"][0]
+    if not address:
+        return None
+    address = str(address)
+    host = {
+        "address": address,
+        "addresses": record.get("addresses") or [{"addr": address, "addrtype": "ipv6" if ":" in address else "ipv4"}],
+        "hostnames": record.get("hostnames", []),
+        "status": record.get("status") if isinstance(record.get("status"), dict) else {"state": record.get("status", "up")},
+        "ports": [normalize_json_port(port) for port in record.get("ports", []) if isinstance(port, dict)],
+        "extraports": record.get("extraports", []),
+    }
+    if record.get("os_matches"):
+        host["os_matches"] = record["os_matches"]
+    return host
+
+
+def has_json_host_shape(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(({"ip", "address", "host", "target"} & set(value)) and isinstance(value.get("ports", []), list))
+    return False
+
+
+def normalize_json_scan(data: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    records: list[dict[str, Any]]
+    if isinstance(data, list) and any(has_json_host_shape(item) for item in data):
+        records = [item for item in data if isinstance(item, dict)]
+    elif isinstance(data, dict) and has_json_host_shape(data):
+        records = [data]
+    elif isinstance(data, dict) and isinstance(data.get("hosts"), list):
+        hosts = [normalize_json_host(item) for item in data["hosts"] if isinstance(item, dict)]
+        hosts = [host for host in hosts if host]
+        runs = [{"run_index": 1, "source_format": "json", "scanner": data.get("scanner", "json"), "scaninfo": [], "hosts": hosts, "raw_json": data}]
+        return runs, flatten_hosts(runs)
+    else:
+        return None
+
+    runs = []
+    for index, record in enumerate(records, start=1):
+        host = normalize_json_host(record)
+        if not host:
+            continue
+        run = {
+            "run_index": index,
+            "source_format": "json",
+            "scanner": record.get("scanner", "json"),
+            "start": record.get("timestamp") or record.get("start"),
+            "scaninfo": [],
+            "hosts": [host],
+        }
+        runs.append(run)
+    return runs, flatten_hosts(runs)
+
+
+def looks_like_ssh_audit(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    markers = {"banner", "kex", "key", "enc", "mac", "fingerprints", "recommendations", "target"}
+    return bool(markers & set(data)) and any(key in data for key in ("kex", "key", "enc", "mac", "banner"))
+
+
+def parse_ssh_audit_target(data: dict[str, Any]) -> tuple[str, int]:
+    target = str(data.get("target") or data.get("host") or data.get("hostname") or data.get("ip") or "unknown-host").strip()
+    port = data.get("port") or 22
+    if target.startswith("[") and "]:" in target:
+        host_part, port_part = target.rsplit(":", 1)
+        target = host_part.strip("[]")
+        if str(port_part).isdigit():
+            port = int(port_part)
+    elif target.count(":") == 1:
+        host_part, port_part = target.rsplit(":", 1)
+        if port_part.isdigit():
+            target = host_part
+            port = int(port_part)
+    return target or "unknown-host", int(port) if str(port).isdigit() else 22
+
+
+def ssh_audit_service(banner: Any) -> dict[str, Any]:
+    service = {"name": "ssh"}
+    if isinstance(banner, dict):
+        raw = str(banner.get("raw") or "").strip()
+        software = str(banner.get("software") or "").strip()
+        protocol = str(banner.get("protocol") or "").strip()
+        if software:
+            product, _, version = software.replace("_", " ").partition(" ")
+            service["product"] = product or software
+            if version:
+                service["version"] = version
+        if raw:
+            service["details"] = raw
+        if protocol:
+            service["extrainfo"] = f"protocol {protocol}"
+    return service
+
+
+def note_lines(notes: Any) -> list[str]:
+    lines: list[str] = []
+    if isinstance(notes, dict):
+        for level in ("fail", "warn", "info"):
+            values = notes.get(level) or []
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                lines.append(f"{level.upper()}: {value}")
+    elif isinstance(notes, list):
+        lines.extend(str(item) for item in notes)
+    elif notes:
+        lines.append(str(notes))
+    return lines
+
+
+def ssh_audit_algorithm_script(script_id: str, title: str, algorithms: Any) -> dict[str, Any] | None:
+    if not isinstance(algorithms, list) or not algorithms:
+        return None
+    lines = [title]
+    for item in algorithms:
+        if not isinstance(item, dict):
+            lines.append(f"- {item}")
+            continue
+        name = item.get("algorithm") or item.get("name") or "unknown"
+        suffix = f" ({item.get('keysize')} bits)" if item.get("keysize") else ""
+        lines.append(f"- {name}{suffix}")
+        for line in note_lines(item.get("notes")):
+            lines.append(f"  {line}")
+    return {"id": script_id, "output": "\n".join(lines)}
+
+
+def ssh_audit_fingerprint_script(fingerprints: Any) -> dict[str, Any] | None:
+    if not isinstance(fingerprints, list) or not fingerprints:
+        return None
+    lines = ["Host key fingerprints"]
+    for item in fingerprints:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('hostkey', 'unknown')} {item.get('hash_alg', '')}: {item.get('hash', '')}".strip())
+    return {"id": "ssh-audit-fingerprints", "output": "\n".join(lines)}
+
+
+def ssh_audit_recommendation_script(recommendations: Any) -> dict[str, Any] | None:
+    if not isinstance(recommendations, dict) or not recommendations:
+        return None
+    lines = ["ssh-audit recommendations"]
+    for severity, actions in recommendations.items():
+        if not isinstance(actions, dict):
+            continue
+        for action, groups in actions.items():
+            if not isinstance(groups, dict):
+                continue
+            for group, items in groups.items():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    name = item.get("name") if isinstance(item, dict) else item
+                    notes = item.get("notes") if isinstance(item, dict) else ""
+                    detail = f" - {notes}" if notes else ""
+                    lines.append(f"- {severity.upper()} {action.upper()} {group}: {name}{detail}")
+    return {"id": "ssh-audit-recommendations", "output": "\n".join(lines)}
+
+
+def normalize_ssh_audit_json(data: dict[str, Any], source_name: str) -> dict[str, Any]:
+    address, port_id = parse_ssh_audit_target(data)
+    scripts = []
+    banner = data.get("banner")
+    if isinstance(banner, dict):
+        scripts.append({"id": "ssh-audit-banner", "output": json.dumps(banner, indent=2, ensure_ascii=False)})
+    for script_id, title, key in (
+        ("ssh-audit-kex", "Key exchange algorithms", "kex"),
+        ("ssh-audit-host-keys", "Host key algorithms", "key"),
+        ("ssh-audit-encryption", "Encryption algorithms", "enc"),
+        ("ssh-audit-mac", "MAC algorithms", "mac"),
+        ("ssh-audit-compression", "Compression algorithms", "compression"),
+    ):
+        script = ssh_audit_algorithm_script(script_id, title, data.get(key))
+        if script:
+            scripts.append(script)
+    for script in (
+        ssh_audit_fingerprint_script(data.get("fingerprints")),
+        ssh_audit_recommendation_script(data.get("recommendations")),
+    ):
+        if script:
+            scripts.append(script)
+    if data.get("additional_notes"):
+        scripts.append({"id": "ssh-audit-notes", "output": "\n\n".join(str(item) for item in data.get("additional_notes") or [])})
+    if data.get("cves"):
+        scripts.append({"id": "ssh-audit-cves", "output": json.dumps(data.get("cves"), indent=2, ensure_ascii=False)})
+
+    host = {
+        "address": address,
+        "addresses": [{"addr": address, "addrtype": "ipv6" if ":" in address else "ipv4"}],
+        "hostnames": [],
+        "status": {"state": "up"},
+        "ports": [{
+            "protocol": "tcp",
+            "portid": port_id,
+            "state": {"state": "open"},
+            "service": ssh_audit_service(data.get("banner")),
+            "scripts": scripts,
+        }],
+        "extraports": [],
+    }
+    run = {
+        "run_index": 1,
+        "source_format": "ssh-audit-json",
+        "scanner": "ssh-audit",
+        "scaninfo": [{"type": "ssh-audit", "protocol": "tcp", "services": str(port_id)}],
+        "hosts": [host],
+        "raw_json": data,
+    }
+    hosts = flatten_hosts([run])
+    cve_inventory = [{"cve": cve, "summary": "Found in ssh-audit output."} for cve in extract_cves(data)]
+    out = {"summary": build_summary(source_name, "ssh-audit-json", [run], hosts, data), "hosts": hosts, "runs": [run], "raw": data}
+    if cve_inventory:
+        out["cve_inventory"] = cve_inventory
+    return out
+
+
+def collect_cve_inventory(data: Any) -> list[dict[str, Any]]:
+    inventory: dict[str, dict[str, Any]] = {}
+
+    def english_description(raw_nvd: Any) -> str:
+        try:
+            descriptions = raw_nvd["vulnerabilities"][0]["cve"].get("descriptions", [])
+        except (KeyError, IndexError, TypeError):
+            return ""
+        for item in descriptions:
+            if item.get("lang") == "en":
+                return str(item.get("value") or "")
+        return ""
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            cve = normalize_cve(item.get("cve") or item.get("id") or item.get("name") or "")
+            if cve:
+                record = inventory.setdefault(cve, {"cve": cve})
+                if item.get("nvd_severity"):
+                    record["severity"] = item["nvd_severity"]
+                if item.get("base_score") is not None:
+                    record["score"] = item["base_score"]
+                summary = item.get("summary") or item.get("description") or english_description(item.get("raw_nvd"))
+                if summary:
+                    record["summary"] = summary
+            for nested in item.values():
+                walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(data)
+    return sorted(inventory.values(), key=lambda item: item["cve"])
+
+
 def normalize_existing_json(data: Any, source_name: str) -> dict[str, Any]:
     if isinstance(data, dict) and {"summary", "hosts", "runs"}.issubset(data):
         out = data
@@ -570,19 +887,85 @@ def normalize_existing_json(data: Any, source_name: str) -> dict[str, Any]:
         out["summary"].setdefault("input_type", "json")
         out["summary"]["cve_count"] = len(extract_cves(out))
         return out
+    if looks_like_ssh_audit(data):
+        return normalize_ssh_audit_json(data, source_name)
+    scan = normalize_json_scan(data)
+    if scan:
+        runs, hosts = scan
+        return {"summary": build_summary(source_name, "json", runs, hosts, data), "hosts": hosts, "runs": runs, "raw": data}
+    cve_inventory = collect_cve_inventory(data)
     runs = [{"run_index": 1, "source_format": "json", "scanner": "unknown", "scaninfo": [], "hosts": [], "raw_json": data}]
     hosts: list[dict[str, Any]] = []
-    return {"summary": build_summary(source_name, "json", runs, hosts, data), "hosts": hosts, "runs": runs, "raw": data}
+    out = {"summary": build_summary(source_name, "json", runs, hosts, data), "hosts": hosts, "runs": runs, "raw": data}
+    if cve_inventory:
+        out["cve_inventory"] = cve_inventory
+    return out
+
+
+def renumber_runs(runs: list[dict[str, Any]], source_name: str, start_index: int) -> list[dict[str, Any]]:
+    renumbered = []
+    for offset, run in enumerate(runs, start=0):
+        item = dict(run)
+        item["original_run_index"] = run.get("run_index")
+        item["run_index"] = start_index + offset
+        item["source_file"] = source_name
+        for host in item.get("hosts", []):
+            if isinstance(host, dict):
+                host.setdefault("source_file", source_name)
+        renumbered.append(item)
+    return renumbered
+
+
+def merge_parsed_documents(documents: list[dict[str, Any]], workspace_name: str = "Workspace") -> dict[str, Any]:
+    runs: list[dict[str, Any]] = []
+    files = []
+    cve_inventory: dict[str, dict[str, Any]] = {}
+    raw_items = []
+
+    for document in documents:
+        summary = document.get("summary", {})
+        source_name = str(summary.get("source_file") or "uploaded file")
+        source_runs = document.get("runs", [])
+        files.append({
+            "name": source_name,
+            "input_type": summary.get("input_type", "unknown"),
+            "run_count": summary.get("run_count", len(source_runs)),
+            "host_count": summary.get("host_count", 0),
+            "open_port_count": summary.get("open_port_count", 0),
+            "script_count": summary.get("script_count", 0),
+            "cve_count": summary.get("cve_count", 0),
+        })
+        runs.extend(renumber_runs(source_runs, source_name, len(runs) + 1))
+        raw_items.append({"source_file": source_name, "data": document.get("raw", document)})
+        for item in document.get("cve_inventory", []):
+            cve = normalize_cve(item.get("cve", ""))
+            if cve and cve not in cve_inventory:
+                cve_inventory[cve] = item
+
+    hosts = flatten_hosts(runs)
+    raw = {"files": raw_items, "cve_inventory": list(cve_inventory.values())}
+    merged = {
+        "summary": build_summary(workspace_name, "workspace", runs, hosts, {"runs": runs, "raw": raw}),
+        "hosts": hosts,
+        "runs": runs,
+        "files": files,
+        "raw": raw,
+    }
+    if cve_inventory:
+        merged["cve_inventory"] = sorted(cve_inventory.values(), key=lambda item: item["cve"])
+    merged["summary"]["file_count"] = len(files)
+    return merged
 
 
 def convert_content(scan_text: str, source_name: str = "uploaded file") -> dict[str, Any]:
     if not scan_text.strip():
-        raise ValueError(f"Input file is empty: {source_name}")
+        LOG.warning("empty_input file=%s", source_name)
+        return empty_analysis(source_name)
 
     stripped = scan_text.lstrip("\ufeff \t\r\n")
     if stripped.startswith("{") or stripped.startswith("["):
         try:
-            return normalize_existing_json(json.loads(scan_text), source_name)
+            return normalize_existing_json(load_json_lenient(scan_text, source_name), source_name)
         except json.JSONDecodeError:
             LOG.debug("json parse failed; falling back to text parser", exc_info=True)
 
@@ -794,21 +1177,27 @@ def check_cve(cve: str, distro: str, version: str) -> dict[str, Any]:
         return enrich({"cve": cve, "status": "Lookup failed", "severity": "", "score": "", "summary": str(exc), "url": url if "url" in locals() else "", "records": []})
 
 
-def parse_multipart_file(content_type: str, body: bytes) -> tuple[str, bytes]:
+def parse_multipart_files(content_type: str, body: bytes) -> list[tuple[str, bytes]]:
     if "multipart/form-data" not in content_type:
         raise ValueError("Expected multipart/form-data upload.")
     message = BytesParser(policy=policy.default).parsebytes(
         f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
     )
+    files = []
     for part in message.iter_parts():
-        if part.get_param("name", header="content-disposition") != "scan_file":
+        field_name = part.get_param("name", header="content-disposition")
+        if field_name not in {"scan_file", "scan_files"}:
             continue
         filename = part.get_filename() or "uploaded-scan"
         payload = part.get_payload(decode=True) or b""
-        if not payload.strip():
-            raise ValueError(f"Input file is empty: {filename}")
-        return filename, payload
-    raise ValueError("No file field named scan_file was found.")
+        files.append((filename, payload))
+    if not files:
+        raise ValueError("No file field named scan_file or scan_files was found.")
+    return files
+
+
+def parse_multipart_file(content_type: str, body: bytes) -> tuple[str, bytes]:
+    return parse_multipart_files(content_type, body)[0]
 
 
 HTML = r"""<!doctype html>
@@ -820,7 +1209,7 @@ HTML = r"""<!doctype html>
 <style>
 :root{color-scheme:light;--bg:#f4f7fb;--panel:#ffffff;--panel2:#f8fafc;--text:#122033;--muted:#66758a;--line:#dbe4ef;--accent:#0f766e;--accent2:#2563eb;--bad:#b42318;--warn:#b7791f;--ok:#0f766e;--violet:#6d28d9;--shadow:0 18px 50px rgba(18,32,51,.08)}
 [data-theme=dark]{color-scheme:dark;--bg:#0b1120;--panel:#111827;--panel2:#172033;--text:#e5edf8;--muted:#94a3b8;--line:#263348;--accent:#2dd4bf;--accent2:#60a5fa;--bad:#fb7185;--warn:#fbbf24;--ok:#34d399;--violet:#a78bfa;--shadow:0 20px 60px rgba(0,0,0,.28)}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,rgba(37,99,235,.12),transparent 32rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button{cursor:pointer}a{color:var(--accent2);overflow-wrap:anywhere}.shell{min-height:100vh}.top{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 24px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(18px)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:var(--shadow)}h1{font-size:22px;margin:0;letter-spacing:0}.sub{margin:2px 0 0;color:var(--muted);font-size:13px}.top-actions{display:flex;gap:10px;align-items:center}.btn,.select,.search{border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);min-height:40px;padding:0 12px}.btn{font-weight:750}.btn.primary{background:var(--accent);border-color:var(--accent);color:#06201d}.btn.ghost{background:transparent}.btn:disabled,.select:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:18px;max-width:1500px;margin:0 auto;padding:18px}.side{display:grid;align-content:start;gap:14px;position:sticky;top:92px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}.pad{padding:16px}.title{font-size:13px;font-weight:850;text-transform:uppercase;letter-spacing:.04em}.drop{display:grid;gap:8px;align-content:center;min-height:138px;margin-top:14px;padding:18px;border:1px dashed color-mix(in srgb,var(--muted) 70%,transparent);border-radius:14px;background:var(--panel2)}.drop:hover,.drop.drag{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel2))}.drop input{display:none}.drop strong{font-size:18px}.muted{color:var(--muted);font-size:13px;line-height:1.45}.stack{display:grid;gap:10px}.message{min-height:20px;margin-top:10px;color:var(--muted);font-size:13px}.message.error{color:var(--bad)}.metrics{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px}.metric{padding:14px;border-top:3px solid color-mix(in srgb,var(--accent2) 35%,var(--line))}.metric b{font-size:26px}.metric span{display:block;margin-top:6px;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase}.main{display:grid;gap:14px;min-width:0}.toolbar{display:grid;grid-template-columns:1fr minmax(240px,460px);gap:12px;align-items:center;padding:16px;border-bottom:1px solid var(--line)}.tabs{display:flex;gap:6px;padding:10px 16px 0}.tab{min-height:36px;padding:0 14px;border:0;border-radius:10px;background:transparent;color:var(--muted);font-weight:800}.tab.active{background:var(--panel2);color:var(--text)}.panel{display:none;padding:16px}.panel.active{display:block}.empty{display:grid;min-height:330px;place-items:center;border:1px dashed var(--line);border-radius:14px;background:var(--panel2);color:var(--muted);text-align:center}.hosts,.cves{display:grid;gap:12px}.host{overflow:hidden}.host-head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px;background:var(--panel2);border-bottom:1px solid var(--line)}.mono{font-family:"Cascadia Mono",Consolas,monospace}.host-ip{font-size:18px;font-weight:850;overflow-wrap:anywhere}.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.chip,.status{display:inline-flex;align-items:center;min-height:25px;padding:0 9px;border-radius:999px;font-size:11px;font-weight:850;text-transform:uppercase}.chip{background:color-mix(in srgb,var(--muted) 16%,transparent);color:var(--muted)}.status{background:var(--muted);color:white}.status-open,.status-up,.status-fixed{background:var(--ok)}.status-affected,.status-lookup-failed{background:var(--bad)}.status-deferred{background:var(--warn);color:#1f1600}.status-out-of-support{background:var(--violet)}.status-not-affected,.status-not-found,.status-not-listed,.status-pending,.status-checking,.status-unknown{background:#64748b}.ports{display:grid}.port-head,.port{display:grid;grid-template-columns:105px 96px minmax(120px,190px) minmax(0,1fr) auto;gap:12px}.port-head{padding:10px 14px;background:var(--panel2);border-bottom:1px solid var(--line);color:var(--muted);font-size:11px;font-weight:850;text-transform:uppercase}.port{align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}.port:last-child{border-bottom:0}.detail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:13px}details.scripts{grid-column:1/-1}details.scripts summary{display:inline-flex;min-height:30px;align-items:center;padding:0 10px;border-radius:10px;background:color-mix(in srgb,var(--accent2) 14%,transparent);color:var(--accent2);font-size:12px;font-weight:850;list-style:none}details.scripts summary::-webkit-details-marker{display:none}.script{max-height:220px;overflow:auto;margin:10px 0 0;padding:12px;border-radius:12px;background:#0f1724;color:#dbeafe;font-size:12px;line-height:1.5;white-space:pre-wrap}.cve-top{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}.count-row{display:flex;flex-basis:100%;flex-wrap:wrap;gap:7px}.count{display:inline-flex;min-height:26px;align-items:center;padding:0 9px;border-radius:999px;color:#fff;font-size:11px;font-weight:850;text-transform:uppercase}.cve-card{overflow:hidden}.cve-head{display:grid;grid-template-columns:150px 130px minmax(0,1fr) 96px;gap:12px;align-items:center;padding:12px;background:var(--panel2);border-bottom:1px solid var(--line)}.cve-body{display:grid;gap:10px;padding:12px}.record{display:grid;grid-template-columns:minmax(110px,180px) minmax(0,1fr) minmax(95px,140px) minmax(0,1fr);gap:10px;padding-top:9px;border-top:1px solid var(--line);font-size:13px}pre.json{max-height:calc(100vh - 230px);min-height:420px;overflow:auto;margin:0;padding:14px;border-radius:12px;background:#0f1724;color:#dbeafe;font-size:12px;line-height:1.55}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,rgba(37,99,235,.12),transparent 32rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button{cursor:pointer}a{color:var(--accent2);overflow-wrap:anywhere}.shell{min-height:100vh}.top{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 24px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(18px)}.brand{display:flex;gap:14px;align-items:center}.mark{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:var(--shadow)}h1{font-size:22px;margin:0;letter-spacing:0}.sub{margin:2px 0 0;color:var(--muted);font-size:13px}.top-actions{display:flex;gap:10px;align-items:center}.btn,.select,.search{border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);min-height:40px;padding:0 12px}.btn{font-weight:750}.btn.primary{background:var(--accent);border-color:var(--accent);color:#06201d}.btn.ghost{background:transparent}.btn:disabled,.select:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:360px minmax(0,1fr);gap:18px;max-width:1560px;margin:0 auto;padding:18px}.side{display:grid;align-content:start;gap:14px;position:sticky;top:92px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}.pad{padding:16px}.title{font-size:13px;font-weight:850;text-transform:uppercase;letter-spacing:.04em}.drop{display:grid;gap:8px;align-content:center;min-height:138px;margin-top:14px;padding:18px;border:1px dashed color-mix(in srgb,var(--muted) 70%,transparent);border-radius:14px;background:var(--panel2)}.drop:hover,.drop.drag{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel2))}.drop input{display:none}.drop strong{font-size:18px}.muted{color:var(--muted);font-size:13px;line-height:1.45}.stack{display:grid;gap:10px}.message{min-height:20px;margin-top:10px;color:var(--muted);font-size:13px}.message.error{color:var(--bad)}.workspace-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.workspace-list{display:grid;gap:8px;margin-top:12px;max-height:260px;overflow:auto}.workspace-item{width:100%;display:grid;gap:4px;text-align:left;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel2);color:var(--text)}.workspace-item.active{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}.workspace-name{font-weight:850;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-list{display:grid;gap:6px;margin-top:12px;max-height:170px;overflow:auto}.file-item{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px}.metric{padding:14px;border-top:3px solid color-mix(in srgb,var(--accent2) 35%,var(--line))}.metric b{font-size:26px}.metric span{display:block;margin-top:6px;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase}.main{display:grid;gap:14px;min-width:0}.toolbar{display:grid;grid-template-columns:1fr minmax(240px,460px);gap:12px;align-items:center;padding:16px;border-bottom:1px solid var(--line)}.tabs{display:flex;gap:6px;padding:10px 16px 0}.tab{min-height:36px;padding:0 14px;border:0;border-radius:10px;background:transparent;color:var(--muted);font-weight:800}.tab.active{background:var(--panel2);color:var(--text)}.panel{display:none;padding:16px}.panel.active{display:block}.empty{display:grid;min-height:330px;place-items:center;border:1px dashed var(--line);border-radius:14px;background:var(--panel2);color:var(--muted);text-align:center}.hosts,.cves{display:grid;gap:12px}.host{overflow:hidden}.host-head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px;background:var(--panel2);border-bottom:1px solid var(--line)}.mono{font-family:"Cascadia Mono",Consolas,monospace}.host-ip{font-size:18px;font-weight:850;overflow-wrap:anywhere}.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.chip,.status{display:inline-flex;align-items:center;min-height:25px;padding:0 9px;border-radius:999px;font-size:11px;font-weight:850;text-transform:uppercase}.chip{background:color-mix(in srgb,var(--muted) 16%,transparent);color:var(--muted)}.status{background:var(--muted);color:white}.status-open,.status-up,.status-fixed{background:var(--ok)}.status-affected,.status-lookup-failed{background:var(--bad)}.status-deferred{background:var(--warn);color:#1f1600}.status-out-of-support{background:var(--violet)}.status-not-affected,.status-not-found,.status-not-listed,.status-pending,.status-checking,.status-unknown{background:#64748b}.ports{display:grid}.port-head,.port{display:grid;grid-template-columns:105px 96px minmax(120px,190px) minmax(0,1fr) auto;gap:12px}.port-head{padding:10px 14px;background:var(--panel2);border-bottom:1px solid var(--line);color:var(--muted);font-size:11px;font-weight:850;text-transform:uppercase}.port{align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}.port:last-child{border-bottom:0}.detail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:13px}details.scripts{grid-column:1/-1}details.scripts summary{display:inline-flex;min-height:30px;align-items:center;padding:0 10px;border-radius:10px;background:color-mix(in srgb,var(--accent2) 14%,transparent);color:var(--accent2);font-size:12px;font-weight:850;list-style:none}details.scripts summary::-webkit-details-marker{display:none}.script{max-height:220px;overflow:auto;margin:10px 0 0;padding:12px;border-radius:12px;background:#0f1724;color:#dbeafe;font-size:12px;line-height:1.5;white-space:pre-wrap}.cve-top{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}.count-row{display:flex;flex-basis:100%;flex-wrap:wrap;gap:7px}.count{display:inline-flex;min-height:26px;align-items:center;padding:0 9px;border-radius:999px;color:#fff;font-size:11px;font-weight:850;text-transform:uppercase}.cve-card{overflow:hidden}.cve-head{display:grid;grid-template-columns:150px 130px minmax(0,1fr) 96px;gap:12px;align-items:center;padding:12px;background:var(--panel2);border-bottom:1px solid var(--line)}.cve-body{display:grid;gap:10px;padding:12px}.record{display:grid;grid-template-columns:minmax(110px,180px) minmax(0,1fr) minmax(95px,140px) minmax(0,1fr);gap:10px;padding-top:9px;border-top:1px solid var(--line);font-size:13px}pre.json{max-height:calc(100vh - 230px);min-height:420px;overflow:auto;margin:0;padding:14px;border-radius:12px;background:#0f1724;color:#dbeafe;font-size:12px;line-height:1.55}
 @media(max-width:1050px){.grid{grid-template-columns:1fr}.side{position:static;grid-template-columns:1fr 1fr}.metrics{grid-template-columns:repeat(3,1fr)}}@media(max-width:760px){.top,.toolbar,.host-head{display:grid;grid-template-columns:1fr}.side,.metrics{grid-template-columns:1fr}.port-head{display:none}.port{grid-template-columns:90px 92px 1fr}.detail,details.scripts{grid-column:1/-1;white-space:normal}.cve-head,.record{grid-template-columns:1fr}.top-actions{display:grid}}
 </style>
 </head>
@@ -833,12 +1222,17 @@ HTML = r"""<!doctype html>
   <main class="grid">
     <aside class="side">
       <section class="card pad">
-        <div class="title">Input Artifact</div>
+        <div class="workspace-head"><div class="title">Workspaces</div><button class="btn ghost" id="newWorkspaceBtn" type="button">New Workspace</button></div>
+        <div id="workspaceList" class="workspace-list"></div>
+      </section>
+      <section class="card pad">
+        <div class="title">Workspace Inputs</div>
         <form id="uploadForm" class="stack">
-          <label class="drop" id="dropZone"><input id="fileInput" name="scan_file" type="file"><strong>Drop or choose a file</strong><span id="fileName" class="muted">XML, TXT, NMAP, JSON, logs, or raw text.</span></label>
-          <button class="btn primary" id="parseBtn" type="submit">Parse File</button>
+          <label class="drop" id="dropZone"><input id="fileInput" name="scan_files" type="file" multiple><strong>Drop or choose files</strong><span id="fileName" class="muted">XML, TXT, NMAP, JSON, logs, or raw text.</span></label>
+          <button class="btn primary" id="parseBtn" type="submit">Bulk Parse Workspace</button>
         </form>
-        <div id="parseMessage" class="message">Waiting for an upload.</div>
+        <div id="fileList" class="file-list"></div>
+        <div id="parseMessage" class="message">Create a workspace, then upload one or more files.</div>
       </section>
       <section class="card pad">
         <div class="title">CVE Workflow</div>
@@ -868,36 +1262,48 @@ HTML = r"""<!doctype html>
   </main>
 </div>
 <script>
-const $=s=>document.querySelector(s);const $$=s=>[...document.querySelectorAll(s)];
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const versions={rhel:["6","7","8","9","10"],ubuntu:["18.04","20.04","22.04","24.04","26.04"]};
-const cveRe=/\bCVE-\d{4}-\d{4,7}\b/gi;let parsed=null,cves=[],checkResults=[];
+const cveRe=/\bCVE-\d{4}-\d{4,7}\b/gi;
+let workspaces=[],activeWorkspaceId=null,parsed=null,cves=[],checkResults=[];
 function msg(el,text,bad=false){el.textContent=text;el.classList.toggle("error",bad)}
 function fmt(v){return typeof v==="string"?v:new Intl.NumberFormat().format(v||0)}
 function cls(v){return "status-"+String(v||"unknown").toLowerCase().replace(/[^a-z0-9]+/g,"-")}
+function current(){return workspaces.find(w=>w.id===activeWorkspaceId)||null}
+function workspaceName(){return current()?.name||"Workspace"}
+function syncFromWorkspace(){let ws=current();parsed=ws?.data||null;cves=ws?.cves||[];checkResults=ws?.checkResults||[]}
+function syncToWorkspace(){let ws=current();if(ws){ws.data=parsed;ws.cves=cves;ws.checkResults=checkResults}}
+function createWorkspace(){let id=crypto.randomUUID?crypto.randomUUID():String(Date.now());let ws={id,name:`Workspace ${workspaces.length+1}`,data:null,cves:[],checkResults:[],files:[]};workspaces.unshift(ws);activeWorkspaceId=id;renderWorkspaceList();renderActive();return ws}
+function setWorkspace(id){if(activeWorkspaceId&&activeWorkspaceId!==id)syncToWorkspace();activeWorkspaceId=id;renderWorkspaceList();renderActive()}
+function renderWorkspaceList(){let root=$("#workspaceList");root.replaceChildren();workspaces.forEach(ws=>{let b=document.createElement("button");b.type="button";b.className=`workspace-item ${ws.id===activeWorkspaceId?"active":""}`;let s=ws.data?.summary||{};b.innerHTML=`<span class="workspace-name">${ws.name}</span><span class="muted">${fmt(s.file_count||ws.files.length)} files · ${fmt(s.host_count)} hosts · ${fmt(s.cve_count)} CVEs</span>`;b.addEventListener("click",()=>setWorkspace(ws.id));root.append(b)})}
+function renderFileList(files=[]){let root=$("#fileList");root.replaceChildren();files.forEach(file=>{let row=document.createElement("div");row.className="file-item";let name=file.name||file;let meta=file.input_type?`${file.input_type} · ${fmt(file.open_port_count)} open ports`:`${fmt(file.size)} bytes`;row.append(Object.assign(document.createElement("span"),{className:"mono",textContent:name}),Object.assign(document.createElement("span"),{className:"muted",textContent:meta}));root.append(row)})}
+function renderActive(){syncFromWorkspace();let ws=current();let summary=parsed?.summary||{};renderMetrics(summary);serviceChart(summary.service_counts||{});$("#jsonOut").textContent=parsed?JSON.stringify(parsed,null,2):"{}";$("#downloadBtn").disabled=!parsed;$("#extractBtn").disabled=!parsed;$("#distroSelect").disabled=!cves.length;$("#versionSelect").disabled=!cves.length;$("#checkBtn").disabled=!cves.length;renderFileList(ws?.files||parsed?.files||[]);renderHosts();if(checkResults.length){renderCheckedCves()}else if(cves.length){renderCveExtracted()}else{let r=$("#cves");r.className="cves empty";r.textContent=parsed?"Extract CVEs for this workspace.":"Bulk parse files to extract CVEs."}msg($("#parseMessage"),parsed?`${workspaceName()} contains ${fmt(summary.file_count||0)} files.`:"Upload one or more files into this workspace.");msg($("#cveMessage"),parsed?"Ready to extract CVEs.":"Parse a workspace first.");renderWorkspaceList()}
 function classify(s){let t=String(s||"").toLowerCase().replace(/_/g," ");if(t.includes("lookup failed"))return"Lookup failed";if(t.includes("not found")||t.includes("404"))return"Not found";if(t.includes("out of support")||t.includes("end of life"))return"Out of support";if(t.includes("deferred")||t.includes("will not fix")||t.includes("ignored"))return"Deferred";if(["affected","new","needed","vulnerable","needs evaluation","needs-triage","needs triage"].includes(t)||t.includes("work in progress"))return"Affected";if(t.includes("not affected")||t.includes("not in release")||t==="dne")return"Not affected";if(t.includes("fixed")||t.includes("released")||t.includes("resolved"))return"Fixed";if(t.includes("not listed"))return"Not listed";if(t.includes("pending"))return"Pending";if(t.includes("checking"))return"Checking";return"Unknown"}
 function pill(text,type="chip"){let e=document.createElement("span");e.className=type==="status"?`status ${cls(text)}`:"chip";e.textContent=text;return e}
 function metric(label,value){let d=document.createElement("div");d.className="card metric";d.innerHTML=`<b>${fmt(value)}</b><span>${label}</span>`;return d}
-function renderMetrics(s={}){$("#metrics").replaceChildren(metric("Runs",s.run_count),metric("Hosts",s.host_count),metric("Open Ports",s.open_port_count),metric("Scripts",s.script_count),metric("CVEs",s.cve_count),metric("Format",s.input_type?String(s.input_type).toUpperCase():"--"))}
+function renderMetrics(s={}){$("#metrics").replaceChildren(metric("Files",s.file_count),metric("Hosts",s.host_count),metric("Open Ports",s.open_port_count),metric("CVEs",s.cve_count),metric("Runs",s.run_count),metric("Scripts",s.script_count))}
 function serviceChart(counts={}){let box=$("#serviceChart");box.replaceChildren();let entries=Object.entries(counts).sort((a,b)=>b[1]-a[1]);if(!entries.length){box.innerHTML='<p class="muted">Services appear after parsing.</p>';return}for(let [name,count] of entries){let row=document.createElement("div");row.className="muted";row.innerHTML=`<span class="mono">${name}</span><b style="float:right;color:var(--text)">${count}</b>`;box.append(row)}}
 function activate(id){$$(".tab").forEach(b=>b.classList.toggle("active",b.dataset.tab===id));$$(".panel").forEach(p=>p.classList.toggle("active",p.id===id))}
 function scriptText(s){return `${s.id?`${s.id}: `:""}${s.output||JSON.stringify(s.data||"",null,2)}`.trim()}
-function searchText(host,port){return [host.address,port.protocol,port.portid,port.state?.state,port.service?.name,port.service?.details,...(port.scripts||[]).map(scriptText)].filter(Boolean).join(" ").toLowerCase()}
-function renderHosts(){let root=$("#hosts");root.classList.remove("empty");root.replaceChildren();if(!parsed){root.classList.add("empty");root.textContent="Upload a scan artifact to begin.";return}let q=$("#filterInput").value.trim().toLowerCase(),shown=0;for(let host of parsed.hosts||[]){let ports=(host.ports||[]).filter(p=>!q||searchText(host,p).includes(q)||String(host.address).toLowerCase().includes(q));if(!ports.length&&!String(host.address).toLowerCase().includes(q))continue;shown++;let card=document.createElement("article");card.className="card host";let meta=document.createElement("div");meta.className="chips";meta.append(pill(`${ports.length} ports`),pill(`runs ${(host.seen_in_runs||[]).join(",")||"1"}`));card.innerHTML=`<div class="host-head"><div><div class="host-ip mono">${host.address||"Unknown host"}</div></div></div>`;card.querySelector(".host-head>div").append(meta);card.querySelector(".host-head").append(pill(host.status?.state||"unknown","status"));let list=document.createElement("div");list.className="ports";let head=document.createElement("div");head.className="port-head";["Port","State","Service","Details","Scripts"].forEach(x=>{let c=document.createElement("div");c.textContent=x;head.append(c)});list.append(head);for(let p of ports){let row=document.createElement("div");row.className="port";let details=[p.service?.product,p.service?.version,p.service?.extrainfo,p.service?.details].filter(Boolean).join(" ")||"No service details";row.append(Object.assign(document.createElement("div"),{className:"mono",textContent:`${p.portid}/${p.protocol}`}),pill(p.state?.state||"unknown","status"),Object.assign(document.createElement("div"),{className:"mono",textContent:p.service?.name||"unknown"}),Object.assign(document.createElement("div"),{className:"detail",textContent:details,title:details}));if((p.scripts||[]).length){let d=document.createElement("details");d.className="scripts";let s=document.createElement("summary");s.textContent=`${p.scripts.length} scripts`;d.append(s);for(let sc of p.scripts){let pre=document.createElement("pre");pre.className="script mono";pre.textContent=scriptText(sc);d.append(pre)}row.append(d)}else row.append(pill("No scripts"));list.append(row)}card.append(list);root.append(card)}$("#resultCount").textContent=`${shown} hosts shown`;if(!shown){root.classList.add("empty");root.textContent="No hosts match the current filter."}}
+function searchText(host,port){return [host.address,port.protocol,port.portid,port.state?.state,port.service?.name,port.service?.details,port.source_file,...(port.scripts||[]).map(scriptText)].filter(Boolean).join(" ").toLowerCase()}
+function renderHosts(){let root=$("#hosts");root.classList.remove("empty");root.replaceChildren();if(!parsed){root.classList.add("empty");root.textContent="Bulk parse files to build this workspace.";$("#resultCount").textContent="No data loaded";return}let q=$("#filterInput").value.trim().toLowerCase(),shown=0;for(let host of parsed.hosts||[]){let ports=(host.ports||[]).filter(p=>!q||searchText(host,p).includes(q)||String(host.address).toLowerCase().includes(q));if(!ports.length&&!String(host.address).toLowerCase().includes(q))continue;shown++;let card=document.createElement("article");card.className="card host";let meta=document.createElement("div");meta.className="chips";meta.append(pill(`${ports.length} ports`),pill(`runs ${(host.seen_in_runs||[]).join(",")||"1"}`));card.innerHTML=`<div class="host-head"><div><div class="host-ip mono">${host.address||"Unknown host"}</div></div></div>`;card.querySelector(".host-head>div").append(meta);card.querySelector(".host-head").append(pill(host.status?.state||"unknown","status"));let list=document.createElement("div");list.className="ports";let head=document.createElement("div");head.className="port-head";["Port","State","Service","Details","Scripts"].forEach(x=>{let c=document.createElement("div");c.textContent=x;head.append(c)});list.append(head);for(let p of ports){let row=document.createElement("div");row.className="port";let details=[p.service?.product,p.service?.version,p.service?.extrainfo,p.service?.details,`runs ${(p.seen_in_runs||[]).join(",")}`].filter(Boolean).join(" ")||"No service details";row.append(Object.assign(document.createElement("div"),{className:"mono",textContent:`${p.portid}/${p.protocol}`}),pill(p.state?.state||"unknown","status"),Object.assign(document.createElement("div"),{className:"mono",textContent:p.service?.name||"unknown"}),Object.assign(document.createElement("div"),{className:"detail",textContent:details,title:details}));if((p.scripts||[]).length){let d=document.createElement("details");d.className="scripts";let s=document.createElement("summary");s.textContent=`${p.scripts.length} scripts`;d.append(s);for(let sc of p.scripts){let pre=document.createElement("pre");pre.className="script mono";pre.textContent=scriptText(sc);d.append(pre)}row.append(d)}else row.append(pill("No scripts"));list.append(row)}card.append(list);root.append(card)}$("#resultCount").textContent=`${workspaceName()} · ${shown} hosts shown · ${fmt(parsed.summary?.file_count)} files combined`;if(!shown){root.classList.add("empty");root.textContent="No hosts match the current filter."}}
 function extractLocal(v){let out=new Set();function walk(x){if(Array.isArray(x))x.forEach(walk);else if(x&&typeof x==="object")Object.entries(x).forEach(([k,val])=>{walk(k);walk(val)});else if(x!==undefined&&x!==null){for(let m of String(x).match(cveRe)||[])out.add(m.toUpperCase())}}walk(v);return [...out].sort()}
-function renderCveExtracted(){let root=$("#cves");root.classList.remove("empty");root.replaceChildren();if(!cves.length){root.classList.add("empty");root.textContent="No CVEs found.";return}let top=document.createElement("div");top.className="cve-top";top.innerHTML=`<b>${cves.length} CVEs extracted</b><span class="muted">${$("#distroSelect").value.toUpperCase()} ${$("#versionSelect").value}</span>`;let chips=document.createElement("div");chips.className="chips";cves.forEach(c=>chips.append(pill(c)));root.append(top,chips)}
+function renderCveExtracted(){let root=$("#cves");root.classList.remove("empty");root.replaceChildren();if(!cves.length){root.classList.add("empty");root.textContent="No CVEs found.";return}let top=document.createElement("div");top.className="cve-top";top.innerHTML=`<b>${cves.length} CVEs extracted</b><span class="muted">${workspaceName()} · ${$("#distroSelect").value.toUpperCase()} ${$("#versionSelect").value}</span>`;let chips=document.createElement("div");chips.className="chips";cves.forEach(c=>chips.append(pill(c)));root.append(top,chips)}
 function countBadges(){let row=$("#countRow");if(!row)return;let order=["Affected","Fixed","Not affected","Deferred","Out of support","Not found","Lookup failed","Not listed","Unknown"];let counts={};checkResults.forEach(r=>counts[r.classification||classify(r.status)]=(counts[r.classification||classify(r.status)]||0)+1);row.replaceChildren();order.filter(k=>counts[k]).forEach(k=>{let e=document.createElement("span");e.className=`count ${cls(k)}`;e.textContent=`${k}: ${counts[k]}`;row.append(e)})}
 function cveId(c){return "row-"+c.replace(/[^a-z0-9]/gi,"-")}
 function cveCard(r){let classification=r.classification||classify(r.status);let card=document.createElement("article");card.className="card cve-card";card.id=cveId(r.cve);let head=document.createElement("div");head.className="cve-head";head.append(Object.assign(document.createElement("b"),{className:"mono",textContent:r.cve}),pill(classification,"status"),Object.assign(document.createElement("span"),{className:"muted",textContent:r.severity||"Severity unavailable"}),Object.assign(document.createElement("span"),{className:"muted",textContent:r.score?`CVSS ${r.score}`:""}));let body=document.createElement("div");body.className="cve-body";body.append(Object.assign(document.createElement("div"),{className:"muted",textContent:r.summary||"No vendor summary."}));if(r.status&&r.status!==classification)body.append(Object.assign(document.createElement("div"),{className:"muted",textContent:`Vendor status: ${r.status}`}));if(r.url){let a=document.createElement("a");a.href=r.url;a.target="_blank";a.rel="noreferrer";a.textContent=r.url;body.append(a)}(r.records||[]).forEach(rec=>{let rr=document.createElement("div");rr.className="record";[rec.package||"package unavailable",rec.product||"product unavailable",rec.status||"status unavailable",rec.detail||""].forEach(v=>rr.append(Object.assign(document.createElement("div"),{textContent:v})));body.append(rr)});card.append(head,body);return card}
-function startChecks(){let root=$("#cves");root.classList.remove("empty");root.replaceChildren();let top=document.createElement("div");top.className="cve-top";top.innerHTML=`<b>${cves.length} CVEs queued</b><span id="progress" class="muted">0 / ${cves.length} checked</span><div id="countRow" class="count-row"></div>`;root.append(top);let list=document.createElement("div");list.className="cves";cves.forEach(c=>list.append(cveCard({cve:c,status:"Pending",summary:"Waiting to check vendor endpoint...",records:[]})));root.append(list);checkResults=[];countBadges()}
+function startChecks(){let root=$("#cves");root.classList.remove("empty");root.replaceChildren();let top=document.createElement("div");top.className="cve-top";top.innerHTML=`<b>${cves.length} CVEs queued</b><span id="progress" class="muted">0 / ${cves.length} checked</span><div id="countRow" class="count-row"></div>`;root.append(top);let list=document.createElement("div");list.className="cves";cves.forEach(c=>list.append(cveCard({cve:c,status:"Pending",summary:"Waiting to check vendor endpoint...",records:[]})));root.append(list);checkResults=[];syncToWorkspace();countBadges()}
+function renderCheckedCves(){let root=$("#cves");root.classList.remove("empty");root.replaceChildren();let top=document.createElement("div");top.className="cve-top";top.innerHTML=`<b>${checkResults.length} CVEs checked</b><span class="muted">${workspaceName()}</span><div id="countRow" class="count-row"></div>`;root.append(top);let list=document.createElement("div");list.className="cves";checkResults.forEach(r=>list.append(cveCard(r)));root.append(list);countBadges()}
 async function checkOne(cve,distro,version){let res=await fetch("/api/check-cve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cve,distro,version})});let body=await res.json();if(!res.ok)throw new Error(body.error||"Lookup failed");return body.result}
 function populateVersions(){let sel=$("#versionSelect");sel.replaceChildren();(versions[$("#distroSelect").value]||[]).forEach(v=>{let o=document.createElement("option");o.value=v;o.textContent=v;sel.append(o)})}
-$("#uploadForm").addEventListener("submit",async e=>{e.preventDefault();let file=$("#fileInput").files[0];if(!file){msg($("#parseMessage"),"Choose a file first.",true);return}$("#parseBtn").disabled=true;msg($("#parseMessage"),"Parsing...");let fd=new FormData();fd.append("scan_file",file);try{let res=await fetch("/api/parse",{method:"POST",body:fd});let body=await res.json();if(!res.ok)throw new Error(body.error||"Parse failed");parsed=body;cves=[];checkResults=[];renderMetrics(body.summary);serviceChart(body.summary.service_counts);$("#jsonOut").textContent=JSON.stringify(body,null,2);$("#downloadBtn").disabled=false;$("#extractBtn").disabled=false;$("#checkBtn").disabled=true;$("#distroSelect").disabled=true;$("#versionSelect").disabled=true;msg($("#parseMessage"),`Parsed ${file.name}`);msg($("#cveMessage"),"Ready to extract CVEs.");renderHosts();activate("hostsPanel")}catch(err){msg($("#parseMessage"),err.message,true)}finally{$("#parseBtn").disabled=false}});
-$("#extractBtn").addEventListener("click",async()=>{if(!parsed)return;$("#extractBtn").disabled=true;msg($("#cveMessage"),"Extracting CVEs...");try{let res=await fetch("/api/extract-cves",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({scan_data:parsed})});let body=await res.json();if(!res.ok)throw new Error(body.error||"Extraction failed");cves=body.cves||[]}catch{cves=extractLocal(parsed)}finally{$("#extractBtn").disabled=false;$("#distroSelect").disabled=!cves.length;$("#versionSelect").disabled=!cves.length;$("#checkBtn").disabled=!cves.length;msg($("#cveMessage"),cves.length?`${cves.length} CVEs extracted.`:"No CVEs found.",!cves.length);renderCveExtracted();activate("cvesPanel")}});
-$("#checkBtn").addEventListener("click",async()=>{if(!cves.length)return;let distro=$("#distroSelect").value,version=$("#versionSelect").value;$("#checkBtn").disabled=true;startChecks();activate("cvesPanel");msg($("#cveMessage"),`Checking ${cves.length} CVEs individually...`);let done=0;for(let c of cves){document.getElementById(cveId(c))?.replaceWith(cveCard({cve:c,status:"Checking",summary:"Requesting vendor API...",records:[]}));try{let r=await checkOne(c,distro,version);checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}catch(err){let r={cve:c,status:"Lookup failed",classification:"Lookup failed",summary:err.message,records:[]};checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}done++;$("#progress").textContent=`${done} / ${cves.length} checked`;countBadges()}msg($("#cveMessage"),`Complete: ${done} CVEs checked.`);$("#checkBtn").disabled=false});
-$("#fileInput").addEventListener("change",()=>{let f=$("#fileInput").files[0];$("#fileName").textContent=f?`${f.name} (${fmt(f.size)} bytes)`:"XML, TXT, NMAP, JSON, logs, or raw text."});
+$("#newWorkspaceBtn").addEventListener("click",()=>createWorkspace());
+$("#uploadForm").addEventListener("submit",async e=>{e.preventDefault();let ws=current()||createWorkspace(),files=[...$("#fileInput").files];if(!files.length){msg($("#parseMessage"),"Choose one or more files first.",true);return}$("#parseBtn").disabled=true;msg($("#parseMessage"),`Parsing ${files.length} files into ${ws.name}...`);let fd=new FormData();files.forEach(file=>fd.append("scan_files",file));try{let res=await fetch("/api/parse-workspace",{method:"POST",headers:{"X-Workspace-Name":ws.name},body:fd});let body=await res.json();if(!res.ok)throw new Error(body.error||"Workspace parse failed");ws.data=body;ws.files=body.files||files.map(f=>({name:f.name,size:f.size}));ws.cves=[];ws.checkResults=[];setWorkspace(ws.id);msg($("#parseMessage"),`Parsed ${files.length} files into ${ws.name}.`);msg($("#cveMessage"),"Ready to extract workspace CVEs.");activate("hostsPanel")}catch(err){msg($("#parseMessage"),err.message,true)}finally{$("#parseBtn").disabled=false}});
+$("#extractBtn").addEventListener("click",async()=>{if(!parsed)return;let ws=current();$("#extractBtn").disabled=true;msg($("#cveMessage"),"Extracting CVEs from combined workspace...");try{let res=await fetch("/api/extract-cves",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({scan_data:parsed})});let body=await res.json();if(!res.ok)throw new Error(body.error||"Extraction failed");cves=body.cves||[]}catch{cves=extractLocal(parsed)}finally{checkResults=[];if(ws){ws.cves=cves;ws.checkResults=[]}$("#extractBtn").disabled=false;$("#distroSelect").disabled=!cves.length;$("#versionSelect").disabled=!cves.length;$("#checkBtn").disabled=!cves.length;msg($("#cveMessage"),cves.length?`${cves.length} unique CVEs extracted from ${workspaceName()}.`:"No CVEs found.",!cves.length);renderCveExtracted();renderWorkspaceList();activate("cvesPanel")}});
+$("#checkBtn").addEventListener("click",async()=>{if(!cves.length)return;let ws=current(),distro=$("#distroSelect").value,version=$("#versionSelect").value;$("#checkBtn").disabled=true;startChecks();activate("cvesPanel");msg($("#cveMessage"),`Checking ${cves.length} CVEs for ${workspaceName()}...`);let done=0;for(let c of cves){document.getElementById(cveId(c))?.replaceWith(cveCard({cve:c,status:"Checking",summary:"Requesting vendor API...",records:[]}));try{let r=await checkOne(c,distro,version);checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}catch(err){let r={cve:c,status:"Lookup failed",classification:"Lookup failed",summary:err.message,records:[]};checkResults.push(r);document.getElementById(cveId(c))?.replaceWith(cveCard(r))}if(ws)ws.checkResults=checkResults;done++;$("#progress").textContent=`${done} / ${cves.length} checked`;countBadges()}msg($("#cveMessage"),`Complete: ${done} CVEs checked.`);$("#checkBtn").disabled=false;renderWorkspaceList()});
+$("#fileInput").addEventListener("change",()=>{let files=[...$("#fileInput").files];$("#fileName").textContent=files.length?`${files.length} files selected`:"XML, TXT, NMAP, JSON, logs, or raw text.";renderFileList(files)});
 $("#dropZone").addEventListener("dragover",e=>{e.preventDefault();$("#dropZone").classList.add("drag")});$("#dropZone").addEventListener("dragleave",()=>$("#dropZone").classList.remove("drag"));$("#dropZone").addEventListener("drop",e=>{e.preventDefault();$("#dropZone").classList.remove("drag");if(e.dataTransfer.files.length){$("#fileInput").files=e.dataTransfer.files;$("#fileInput").dispatchEvent(new Event("change"))}});
-$("#filterInput").addEventListener("input",renderHosts);$$(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.tab)));$("#downloadBtn").addEventListener("click",()=>{if(!parsed)return;let blob=new Blob([JSON.stringify(parsed,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download="scanlens-output.json";a.click();URL.revokeObjectURL(url)});
-$("#themeBtn").addEventListener("click",()=>{let html=document.documentElement,next=html.dataset.theme==="dark"?"light":"dark";html.dataset.theme=next;localStorage.setItem("theme",next);$("#themeBtn").textContent=next==="dark"?"Dark":"Light"});let saved=localStorage.getItem("theme")||"light";document.documentElement.dataset.theme=saved;$("#themeBtn").textContent=saved==="dark"?"Dark":"Light";populateVersions();$("#distroSelect").addEventListener("change",()=>{populateVersions();if(cves.length)renderCveExtracted()});renderMetrics();
+$("#filterInput").addEventListener("input",renderHosts);$$(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.tab)));$("#downloadBtn").addEventListener("click",()=>{if(!parsed)return;let blob=new Blob([JSON.stringify(parsed,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`${workspaceName().toLowerCase().replace(/[^a-z0-9]+/g,"-") || "workspace"}-scanlens.json`;a.click();URL.revokeObjectURL(url)});
+$("#themeBtn").addEventListener("click",()=>{let html=document.documentElement,next=html.dataset.theme==="dark"?"light":"dark";html.dataset.theme=next;localStorage.setItem("theme",next);$("#themeBtn").textContent=next==="dark"?"Dark":"Light"});let saved=localStorage.getItem("theme")||"light";document.documentElement.dataset.theme=saved;$("#themeBtn").textContent=saved==="dark"?"Dark":"Light";populateVersions();$("#distroSelect").addEventListener("change",()=>{populateVersions();if(cves.length)renderCveExtracted()});createWorkspace();
 </script>
 </body>
 </html>"""
@@ -925,6 +1331,8 @@ class AppHandler(BaseHTTPRequestHandler):
         LOG.debug("POST path=%s content_length=%s", path, self.headers.get("Content-Length", "0"))
         if path == "/api/parse":
             self.handle_parse()
+        elif path == "/api/parse-workspace":
+            self.handle_parse_workspace()
         elif path == "/api/extract-cves":
             self.handle_extract()
         elif path == "/api/check-cve":
@@ -958,6 +1366,39 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json(data)
         except Exception as exc:
             LOG.exception("parse failed elapsed_ms=%.1f", elapsed_ms(started))
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def handle_parse_workspace(self) -> None:
+        started = time.perf_counter()
+        try:
+            uploads = parse_multipart_files(self.headers.get("Content-Type", ""), self.read_body())
+            documents = []
+            for filename, payload in uploads:
+                text = payload.decode("utf-8-sig", errors="replace")
+                document = convert_content(text, filename)
+                documents.append(document)
+                LOG.debug(
+                    "workspace_file parsed file=%s type=%s hosts=%s runs=%s cves=%s",
+                    filename,
+                    document["summary"]["input_type"],
+                    document["summary"]["host_count"],
+                    document["summary"]["run_count"],
+                    document["summary"]["cve_count"],
+                )
+            workspace_name = self.headers.get("X-Workspace-Name", "Workspace")
+            data = merge_parsed_documents(documents, workspace_name)
+            LOG.info(
+                "parse_workspace ok workspace=%s files=%s hosts=%s runs=%s cves=%s elapsed_ms=%.1f",
+                workspace_name,
+                len(uploads),
+                data["summary"]["host_count"],
+                data["summary"]["run_count"],
+                data["summary"]["cve_count"],
+                elapsed_ms(started),
+            )
+            self.send_json(data)
+        except Exception as exc:
+            LOG.exception("parse_workspace failed elapsed_ms=%.1f", elapsed_ms(started))
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def handle_extract(self) -> None:

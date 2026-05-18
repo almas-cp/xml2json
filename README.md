@@ -10,9 +10,15 @@ and JavaScript. There are no third-party Python dependencies.
 ## Features
 
 - Upload `.xml`, `.txt`, `.nmap`, `.json`, logs, or raw text scan artifacts.
-- Parse Nmap XML, appended Nmap XML, Nmap normal text output, and JSON payloads.
-- Normalize hosts, ports, services, scripts, and scan summaries.
-- Extract CVEs from any parsed field or raw artifact content.
+- Create multiple in-browser workspaces and bulk parse several files into each
+  workspace.
+- Parse Nmap XML, appended Nmap XML, Nmap normal text output, lightweight
+  ports JSON, ssh-audit JSON, CVE inventory JSON, empty placeholders, and
+  generic JSON payloads.
+- Normalize hosts, ports, services, scripts, and scan summaries into one
+  combined unique analysis per workspace.
+- Extract CVEs from the combined workspace output, any parsed field, or raw
+  artifact content.
 - Check each CVE individually against:
   - Red Hat: `https://access.redhat.com/hydra/rest/securitydata/cve/{CVE-ID}.json`
   - Ubuntu: `https://ubuntu.com/security/cves/{CVE-ID}.json`
